@@ -1,0 +1,185 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "MenuSystem.h"
+#include "bitmaps.h"
+
+// Dimensions de l'écran
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// Création d'une instance de l'écran OLED
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pins pour l'encodeur rotatif
+#define ENCODER_PIN_A 2
+#define ENCODER_PIN_B 3
+#define ENCODER_BUTTON_PIN 26
+
+// Variables de l'encodeur
+volatile int encoderPos = 0;
+volatile int encoderCount = 0;
+int lastMSB = 0;
+int lastLSB = 0;
+const unsigned long debounceDelay = 100; // Délai en millisecondes
+unsigned long lastEncoderUpdate = 0;
+bool buttonPressed = false; // Drapeau pour suivre l'état du bouton
+
+// Variables pour la gestion du bouton
+unsigned long buttonPressStart = 0;
+unsigned long lastButtonPress = 0;
+bool longPressHandled = false; // Drapeau pour savoir si l'appui long a été traité
+const unsigned long longPressDuration = 3000; // Durée d'appui long en millisecondes
+
+// Seuils pour la navigation
+const int NAVIGATION_THRESHOLD = 1; // Seuil ajusté pour éviter les sauts
+const int NAVIGATION_PRECISION = 1; // Nombre de pas à accumuler avant de déplacer le curseur
+
+// Instanciation du menu
+MenuSystem menu;
+
+void setup() {
+    Serial.begin(9600);
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("Échec de l'allocation SSD1306"));
+        for (;;); // Boucle infinie en cas d'échec d'initialisation
+    }
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+    pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+    pinMode(ENCODER_BUTTON_PIN, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), updateEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), updateEncoder, CHANGE);
+
+    menu.setDisplay(&display);
+    menu.setEncoderState(&encoderPos, nullptr, nullptr);
+    menu.initialize();
+    menu.displayMenu();
+}
+
+void loop() {
+    unsigned long currentMillis = millis();
+
+    // Vérifier si l'encodeur a été tourné
+    if (currentMillis - lastEncoderUpdate >= debounceDelay) {
+        int steps = encoderPos;
+
+        if (abs(steps) >= NAVIGATION_THRESHOLD) {
+            // Accumuler les mouvements pour éviter les sauts
+            static int accumulatedSteps = 0;
+            accumulatedSteps += steps;
+
+            if (abs(accumulatedSteps) >= NAVIGATION_PRECISION) {
+                menu.handleNavigation(accumulatedSteps / NAVIGATION_PRECISION); 
+                accumulatedSteps = 0; // Réinitialiser le compteur de mouvements
+            }
+
+            encoderPos = 0; // Réinitialiser la position de l'encodeur après traitement
+            lastEncoderUpdate = currentMillis;
+        }
+    }
+
+    // Gérer les sélections de l'encodeur
+    static bool lastButtonState = HIGH;
+    bool currentButtonState = digitalRead(ENCODER_BUTTON_PIN);
+
+    if (currentButtonState == LOW && lastButtonState == HIGH) {
+        delay(50); // Debouncing du bouton
+        buttonPressed = true; // Marquer le bouton comme pressé
+        buttonPressStart = millis(); // Enregistrer l'heure de début de l'appui
+        longPressHandled = false; // Réinitialiser le drapeau d'appui long
+    } else if (currentButtonState == LOW && buttonPressed) {
+        // Si le bouton est maintenu enfoncé
+        if (!longPressHandled && (millis() - buttonPressStart >= longPressDuration)) {
+            // Traiter l'appui long
+            activateSleepMode();
+            longPressHandled = true; // Marquer l'appui long comme traité
+        }
+    } else if (currentButtonState == HIGH && lastButtonState == LOW) {
+        // Si le bouton est relâché
+        if (buttonPressed && !longPressHandled) {
+            if (millis() - lastButtonPress < 500) {
+                // Double appui détecté
+                menu.handleBackNavigation(); // Traiter le retour en arrière
+            } else {
+                menu.handleSelection(); // Traiter la sélection si le bouton était pressé
+            }
+            menu.displayMenu(); // Mettre à jour l'affichage après sélection
+        }
+        buttonPressed = false; // Réinitialiser le drapeau du bouton
+        lastButtonPress = millis(); // Enregistrer le temps du dernier appui
+    }
+    lastButtonState = currentButtonState;
+}
+
+// Fonction d'interruption pour mettre à jour la position de l'encodeur
+void updateEncoder() {
+    int MSB = digitalRead(ENCODER_PIN_A); // Most Significant Bit
+    int LSB = digitalRead(ENCODER_PIN_B); // Least Significant Bit
+
+    int encoded = (MSB << 1) | LSB; // Encode les bits
+    int lastEncoded = (lastMSB << 1) | lastLSB; // Combine les valeurs des états précédents
+
+    // Comparer les états pour déterminer la direction
+    if (lastEncoded == 0b00) {
+        if (encoded == 0b01) encoderCount++; // Compter les impulsions
+        else if (encoded == 0b10) encoderCount--;
+    } else if (lastEncoded == 0b01) {
+        if (encoded == 0b11) encoderCount++;
+        else if (encoded == 0b00) encoderCount--;
+    } else if (lastEncoded == 0b11) {
+        if (encoded == 0b10) encoderCount++;
+        else if (encoded == 0b01) encoderCount--;
+    } else if (lastEncoded == 0b10) {
+        if (encoded == 0b00) encoderCount++;
+        else if (encoded == 0b11) encoderCount--;
+    }
+
+    // Mettre à jour la position en comptant les impulsions
+    if (encoderCount >= 4) {
+        encoderPos++;
+        encoderCount -= 4; // Compte les impulsions pour un mouvement de crantage complet
+    } else if (encoderCount <= -4) {
+        encoderPos--;
+        encoderCount += 4;
+    }
+
+    lastMSB = MSB;
+    lastLSB = LSB;
+}
+
+void activateSleepMode() {
+    // Afficher le logo avant de mettre l'écran en veille
+    display.clearDisplay();
+    display.drawBitmap(0, 0, RS_logo, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+    display.display();
+
+    delay(2000); // Pause pour que l'image soit visible avant d'éteindre l'écran
+
+    // Mettre en veille l'écran
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+
+    // Attendre un appui sur le bouton pour sortir du mode veille
+    while (digitalRead(ENCODER_BUTTON_PIN) == HIGH) {
+        delay(10); // Petite pause pour éviter une boucle trop rapide
+    }
+
+    // Sortir du mode veille
+    display.ssd1306_command(SSD1306_DISPLAYON);
+
+    // Afficher le logo à la sortie du mode veille
+    display.clearDisplay();
+    display.drawBitmap(0, 0, RS_logo, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+    display.display();
+
+    delay(2000); // Pause pour que l'image soit visible après la sortie du mode veille
+
+    menu.displayMenu(); // Réafficher le menu
+}

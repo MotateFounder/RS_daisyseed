@@ -1,0 +1,472 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "MenuSystem.h"
+#include "MyOscillator.h" // Assurez-vous d'utiliser le bon nom de fichier
+#include "bitmaps.h"
+#include <DaisyDuino.h>
+
+// Dimensions de l'écran
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// Création d'une instance de l'écran OLED
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pins pour les encodeurs rotatifs
+#define ENCODER_PIN_A 2
+#define ENCODER_PIN_B 3
+#define ENCODER_BUTTON_PIN 26
+
+#define VOLUME_ENCODER_PIN_A 0
+#define VOLUME_ENCODER_PIN_B 1
+#define VOLUME_ENCODER_BUTTON_PIN 27
+
+// Variables de l'encodeur principal
+volatile int encoderPos = 0;
+volatile int encoderCount = 0;
+int lastMSB = 0;
+int lastLSB = 0;
+const unsigned long debounceDelay = 25; // Délai réduit pour une meilleure réactivité
+unsigned long lastEncoderUpdate = 0;
+bool buttonPressed = false; // Drapeau pour suivre l'état du bouton
+
+// Variables pour la gestion du bouton
+unsigned long buttonPressStart = 0;
+unsigned long lastButtonPress = 0;
+bool longPressHandled = false; // Drapeau pour savoir si l'appui long a été traité
+const unsigned long longPressDuration = 3000; // Durée d'appui long en millisecondes
+
+// Seuils pour la navigation
+//const int NAVIGATION_THRESHOLD = 1; // Seuil ajusté pour éviter les sauts
+//const int NAVIGATION_PRECISION = 1; // Nombre de pas à accumuler avant de déplacer le curseur
+
+// Variables pour le volume
+volatile int volumeEncoderPos = 0;
+volatile int volumeEncoderCount = 0;
+int lastVolumeMSB = 0;
+int lastVolumeLSB = 0;
+const int MAX_VOLUME = 100; // Volume maximum
+int currentVolume = 50; // Volume par défaut à 50%
+
+float amp_knob;
+int Trig;
+
+// Instanciation du menu
+MenuSystem menu;
+bool isSleepMode = false; // Variable pour suivre le mode veille
+
+// Instanciation de l'oscillateur
+MyOscillator myosc;
+
+DaisyHardware hw;
+
+size_t num_channels;
+
+int output_T[] = {5, 6, 7, 8, 9}; // Version 25 keys, ajouter un pin pour 5 notes supplémentaires (10, 13, 14)
+const size_t num_outputs = 5;
+
+// Déclaration des entrées analogiques MK0-MK4 et BR0-BR4
+int input_MK[] = {A0, A2, A4, A6, A8};  // entrées analogiques MK
+int input_BR[] = {A1, A3, A5, A7, A9};  // entrées analogiques BR
+
+int input_joystick[] = {A10, A11, 4}; // entrées analogiques et numériques du joystick (X, Y, SW)
+
+const size_t num_inputs = 5;
+const float threshold_voltage = 2.4; // Seuil de détection de 2.4V
+
+// Index pour le balayage des sorties T0-T7
+int current_output = 0;
+float elapsed_time = 0.0;
+
+// État précédent du signal pour détection de front montant
+bool last_signal_state_MK[num_inputs] = {false}; 
+bool last_signal_state_BR[num_inputs] = {false};
+
+// Temps des derniers fronts montants pour chaque paire
+unsigned long last_detection_time[num_inputs] = {0};
+unsigned long last_detect_check[num_inputs] = {0};
+
+// Délai en millisecondes
+const unsigned long debounce_delay_note = 250 / 1.75; 
+const unsigned long debounce_delay_note_long = 350 / 1.75; 
+
+// Variable globale pour stocker l'interaction détectée
+int interaction = 0;
+
+// Variables globales pour stocker les valeurs analogiques
+float analog_values_MK[num_inputs] = {0.0};
+float analog_values_BR[num_inputs] = {0.0};
+float analog_X;
+float analog_Y;
+
+
+float calculateVelocity(unsigned long delay) {
+  const float minDelay = 600.0;  // 0.6 ms
+  const float maxDelay = 2000.0; // 2 ms
+
+  if (delay < minDelay) {
+    return 1.0; // Vélocité maximale
+  } else if (delay > maxDelay) {
+    return 0.0; // Vélocité minimale
+  } else {
+    // Interpolation linéaire entre minDelay et maxDelay
+    return 1.0 - (delay - minDelay) / (maxDelay - minDelay);
+  }
+}
+
+
+void InitAudio() {
+    // Initialize seed at 48kHz
+    float sample_rate;
+    hw = DAISY.init(DAISY_SEED, AUDIO_SR_48K);
+    num_channels = hw.num_channels;
+    sample_rate = DAISY.get_samplerate();
+    // Appel de l'initialisation audio dans MyOscillator
+    myosc.InitializeAudio(sample_rate);
+
+    // Start callback
+    DAISY.begin(MyCallback);
+}
+
+void MyCallback(float **in, float **out, size_t size) {
+  for (size_t i = 0; i < size; i++) {
+    // État de la machine : activer la sortie courante pour une courte durée
+    if (elapsed_time < 0.001 / 1.75) { // Ajuster ce délai si nécessaire
+      digitalWrite(output_T[current_output], HIGH); // Activer la sortie courante
+    } else {
+      digitalWrite(output_T[current_output], LOW); // Désactiver la sortie
+    }
+
+    // Utilisation des valeurs analogiques lues dans loop()
+    for (size_t k = 0; k < num_inputs; k++) {
+      float analog_value_MK = analog_values_MK[k];
+      float analog_value_BR = analog_values_BR[k];
+
+      // Détection du front montant pour MK
+      bool current_signal_state_MK = analog_value_MK > threshold_voltage;
+      if (current_signal_state_MK && !last_signal_state_MK[k]) {
+        if (millis() - last_detect_check[k] > debounce_delay_note) {
+          //Serial.print("MK - time: ");
+          //Serial.println(millis());
+          //Serial.print("MK - last detection: ");
+          //Serial.println(last_detection_time[k]);
+          last_detection_time[k] = millis(); // Mise à jour du temps de détection
+        }
+        last_detect_check[k] = millis();
+      }
+      last_signal_state_MK[k] = current_signal_state_MK;
+
+      // Détection du front montant pour BR
+      bool current_signal_state_BR = analog_value_BR > threshold_voltage;
+      if (current_signal_state_BR && !last_signal_state_BR[k]) {
+        if (millis() - last_detect_check[k] > debounce_delay_note) {
+          //Serial.print("BR - last detection: ");
+          //Serial.println(last_detection_time[k]);
+          unsigned long delay = millis() - last_detection_time[k];
+          float velocity = calculateVelocity(delay);
+          Serial.print("Delay: ");
+          Serial.println(delay);
+          Serial.print("Velocity: ");
+          Serial.println(velocity);
+
+          // Calculer l'index de l'interaction
+          interaction = current_output + 1 + k * num_outputs;  // num_outputs = 5 si 25 keys
+
+          // Déclencher l'enveloppe et adapter le volume
+          Trig = 1;
+          amp_knob = velocity; // Ajuster le volume en fonction de la vélocité
+          
+          last_detection_time[k] = millis(); // Mise à jour du temps de détection
+        }
+        last_detect_check[k] = millis();
+      }
+      last_signal_state_BR[k] = current_signal_state_BR;
+    }
+
+    // Jouer une note sinus à la fréquence correspondante
+    if (interaction > 0) {
+      float frequency = pow(2.0, (interaction - 1) / 12.0) * 130.8; // Exemple: Interaction 1 = 130.8 Hz, Interaction 2 = 261.6 Hz, etc.
+      myosc.SetFrequency(frequency);
+    }
+
+    // Process the audio
+    myosc.ProcessAudio(i, out, amp_knob, Trig); // Amplitude en fonction de la vélocité
+    Trig = 0;
+    amp_knob = 1;
+
+
+    // Mise à jour du temps écoulé
+    elapsed_time += 1.0 / DAISY.get_samplerate();
+    if (elapsed_time >= 0.002 / 1.75) { // Réduire le délai d'activation pour une fréquence plus élevée
+      elapsed_time = 0.0;
+      // Passer à l'état suivant (sortie T suivante)
+      current_output = (current_output + 1) % num_outputs;
+    }
+  }
+}
+
+
+void setup() {
+    Serial.begin(9600);
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("Échec de l'allocation SSD1306"));
+        for (;;); // Boucle infinie en cas d'échec d'initialisation
+    }
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // Initialisez l'oscillateur
+    myosc.Initialize(&hw); // Assurez-vous que DaisyHardware est correctement initialisé
+    InitAudio();
+    
+
+    pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+    pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+    pinMode(ENCODER_BUTTON_PIN, INPUT_PULLUP);
+
+    pinMode(VOLUME_ENCODER_PIN_A, INPUT_PULLUP);
+    pinMode(VOLUME_ENCODER_PIN_B, INPUT_PULLUP);
+    pinMode(VOLUME_ENCODER_BUTTON_PIN, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), updateEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), updateEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(VOLUME_ENCODER_PIN_A), updateVolumeEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(VOLUME_ENCODER_PIN_B), updateVolumeEncoder, CHANGE);
+
+
+      // Initialisation des sorties T0-T7
+    for (size_t j = 0; j < num_outputs; j++) {
+      pinMode(output_T[j], OUTPUT);
+    }
+
+    // Initialisation des entrées analogiques
+    for (size_t k = 0; k < num_inputs; k++) {
+      pinMode(input_MK[k], INPUT);
+      pinMode(input_BR[k], INPUT);
+    }
+
+ 
+    menu.setDisplay(&display);
+    menu.setEncoderState(&encoderPos, nullptr, nullptr);
+    menu.initialize();
+    menu.displayMenu();
+
+    Serial.println("Setup complete");
+}
+
+void loop() {
+    analogReadResolution(16);
+
+    analog_X = analogRead(input_joystick[0]) * (3.3 / 65535.0);
+    analog_Y = analogRead(input_joystick[1]) * (3.3 / 65535.0);
+
+    // Lecture des valeurs analogiques et stockage dans des variables globales
+   for (size_t k = 0; k < num_inputs; k++) {
+      analog_values_MK[k] = analogRead(input_MK[k]) * (3.3 / 65535.0); // Conversion en tension (3.3V et 16 bits)
+      analog_values_BR[k] = analogRead(input_BR[k]) * (3.3 / 65535.0); // Conversion en tension (3.3V et 16 bits)
+   }
+
+    unsigned long currentMillis = millis();
+
+    // Vérifier si l'encodeur principal a été tourné
+    if (currentMillis - lastEncoderUpdate >= debounceDelay) {
+        int steps = encoderPos;
+
+        if (abs(steps) >= 1) {
+            // Accumuler les mouvements pour éviter les sauts
+            static int accumulatedSteps = 0;
+            accumulatedSteps += steps;
+
+            if (abs(accumulatedSteps) >= 1) {
+                menu.handleNavigation(accumulatedSteps); 
+                accumulatedSteps = 0; // Réinitialiser le compteur de mouvements
+            }
+
+            encoderPos = 0; // Réinitialiser la position de l'encodeur après traitement
+            lastEncoderUpdate = currentMillis;
+        }
+    }
+
+    // Gérer les sélections de l'encodeur principal
+    static bool lastButtonState = HIGH;
+    bool currentButtonState = digitalRead(ENCODER_BUTTON_PIN);
+
+    if (currentButtonState == LOW && lastButtonState == HIGH) {
+        delay(20); // Debouncing du bouton réduit pour une meilleure réactivité
+        buttonPressed = true; // Marquer le bouton comme pressé
+        buttonPressStart = millis(); // Enregistrer l'heure de début de l'appui
+        longPressHandled = false; // Réinitialiser le drapeau d'appui long
+    } else if (currentButtonState == LOW && buttonPressed) {
+        // Si le bouton est maintenu enfoncé
+        if (!longPressHandled && (millis() - buttonPressStart >= longPressDuration)) {
+            // Traiter l'appui long
+            activateSleepMode();
+            longPressHandled = true; // Marquer l'appui long comme traité
+        }
+    } else if (currentButtonState == HIGH && lastButtonState == LOW) {
+        // Si le bouton est relâché
+        if (buttonPressed && !longPressHandled) {
+            if (millis() - lastButtonPress < 500) {
+                // Double appui détecté
+                menu.handleBackNavigation(); // Traiter le retour en arrière
+            } else {
+                menu.handleSelection(); // Traiter la sélection si le bouton était pressé
+            }
+            //menu.displayMenu(); // Mettre à jour l'affichage après sélection
+        }
+        buttonPressed = false; // Réinitialiser le drapeau du bouton
+        lastButtonPress = millis(); // Enregistrer le temps du dernier appui
+    }
+    lastButtonState = currentButtonState;
+
+    // Gérer le volume
+    static unsigned long lastVolumeUpdate = 0;
+    if (currentMillis - lastVolumeUpdate >= debounceDelay) {
+        if (volumeEncoderPos != 0) {
+            currentVolume = constrain(currentVolume + volumeEncoderPos, 0, MAX_VOLUME);
+            myosc.SetVolume(currentVolume);
+            volumeEncoderPos = 0; // Réinitialiser la position du volume
+            lastVolumeUpdate = currentMillis;
+        }
+    }
+
+    // Mettre à jour l'affichage
+    updateDisplay();
+
+    int oscType = menu.getCurrentOscillator();
+    myosc.UpdateOscillator(oscType);
+}
+
+// Fonction d'interruption pour mettre à jour la position de l'encodeur principal
+void updateEncoder() {
+    int MSB = digitalRead(ENCODER_PIN_A); // Most Significant Bit
+    int LSB = digitalRead(ENCODER_PIN_B); // Least Significant Bit
+
+    int encoded = (MSB << 1) | LSB; // Encode les bits
+    int lastEncoded = (lastMSB << 1) | lastLSB; // Combine les valeurs des états précédents
+
+    // Comparer les états pour déterminer la direction
+    if (lastEncoded == 0b00) {
+        if (encoded == 0b01) encoderCount++; // Compter les impulsions
+        else if (encoded == 0b10) encoderCount--;
+    } else if (lastEncoded == 0b01) {
+        if (encoded == 0b11) encoderCount++;
+        else if (encoded == 0b00) encoderCount--;
+    } else if (lastEncoded == 0b11) {
+        if (encoded == 0b10) encoderCount++;
+        else if (encoded == 0b01) encoderCount--;
+    } else if (lastEncoded == 0b10) {
+        if (encoded == 0b00) encoderCount++;
+        else if (encoded == 0b11) encoderCount--;
+    }
+
+    // Mettre à jour la position en comptant les impulsions
+    if (encoderCount >= 4) {
+        encoderPos++;
+        encoderCount -= 4; // Compte les impulsions pour un mouvement de crantage complet
+    } else if (encoderCount <= -4) {
+        encoderPos--;
+        encoderCount += 4;
+    }
+
+    lastMSB = MSB;
+    lastLSB = LSB;
+}
+
+// Fonction d'interruption pour mettre à jour la position du second encodeur (volume)
+void updateVolumeEncoder() {
+    int MSB = digitalRead(VOLUME_ENCODER_PIN_A); // Most Significant Bit
+    int LSB = digitalRead(VOLUME_ENCODER_PIN_B); // Least Significant Bit
+
+    int encoded = (MSB << 1) | LSB; // Encode les bits
+    int lastEncoded = (lastVolumeMSB << 1) | lastVolumeLSB; // Combine les valeurs des états précédents
+
+    // Comparer les états pour déterminer la direction
+    if (lastEncoded == 0b00) {
+        if (encoded == 0b01) volumeEncoderCount++;
+        else if (encoded == 0b10) volumeEncoderCount--;
+    } else if (lastEncoded == 0b01) {
+        if (encoded == 0b11) volumeEncoderCount++;
+        else if (encoded == 0b00) volumeEncoderCount--;
+    } else if (lastEncoded == 0b11) {
+        if (encoded == 0b10) volumeEncoderCount++;
+        else if (encoded == 0b01) volumeEncoderCount--;
+    } else if (lastEncoded == 0b10) {
+        if (encoded == 0b00) volumeEncoderCount++;
+        else if (encoded == 0b11) volumeEncoderCount--;
+    }
+
+    // Mettre à jour la position en comptant les impulsions
+    if (volumeEncoderCount >= 4) {
+        volumeEncoderPos++;
+        volumeEncoderCount -= 4; // Compte les impulsions pour un mouvement de crantage complet
+    } else if (volumeEncoderCount <= -4) {
+        volumeEncoderPos--;
+        volumeEncoderCount += 4;
+    }
+
+    lastVolumeMSB = MSB;
+    lastVolumeLSB = LSB;
+}
+
+// Fonction pour activer le mode veille
+void activateSleepMode() {
+    // Afficher le logo avant de mettre l'écran en veille
+    display.clearDisplay();
+    display.drawBitmap(0, 0, RS_logo, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+    display.display();
+
+    delay(2000); // Pause pour que l'image soit visible avant d'éteindre l'écran
+
+    // Mettre en veille l'écran
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    isSleepMode = true; // Activer le mode veille
+    myosc.SetVolume(0);
+
+    // Attendre un appui sur le bouton pour sortir du mode veille
+    while (digitalRead(ENCODER_BUTTON_PIN) == HIGH) {
+        delay(10); // Petite pause pour éviter une boucle trop rapide
+    }
+
+    // Sortir du mode veille
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    isSleepMode = false; // Désactiver le mode veille
+
+    // Réinitialiser l'affichage et les menus après la sortie du mode veille
+    display.clearDisplay();
+    display.drawBitmap(0, 0, RS_logo, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+    display.display();
+
+    delay(2000);
+    
+    currentVolume = constrain(currentVolume + volumeEncoderPos, 0, MAX_VOLUME);
+    myosc.SetVolume(currentVolume);
+    menu.displayMenu(); // Réafficher le menu
+}
+
+// Fonction pour mettre à jour l'affichage
+void updateDisplay() {
+    //display.clearDisplay();
+
+    if (!isSleepMode) {
+        // Afficher le menu
+        menu.displayMenu();
+
+        // Dessiner la jauge de volume à droite
+        int gaugeWidth = 5; // Largeur réduite de moitié
+        int gaugeHeight = 50;
+        int gaugeX = SCREEN_WIDTH - gaugeWidth - 2; // Position à droite
+        int gaugeY = 7; // Position verticale
+
+        int filledHeight = map(currentVolume, 0, MAX_VOLUME, 0, gaugeHeight);
+
+        display.drawRect(gaugeX, gaugeY, gaugeWidth, gaugeHeight, SSD1306_WHITE); // Bord de la jauge
+        display.fillRect(gaugeX, gaugeY + gaugeHeight - filledHeight, gaugeWidth, filledHeight, SSD1306_WHITE); // Remplissage
+    }
+    display.display();
+}

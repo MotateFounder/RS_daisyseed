@@ -1,0 +1,194 @@
+#include <Arduino.h>
+#include "DaisyDuino.h"
+
+DaisyHardware hw;
+static Oscillator osc;
+static AdEnv adenv;
+float pitch_knob;
+float amp_knob;
+
+size_t num_channels;
+
+int output_T[] = {5, 6, 7, 8, 9}; // Version 25 keys, ajouter un pin pour 5 notes supplémentaires (10, 13, 14)
+const size_t num_outputs = 5;
+
+// Déclaration des entrées analogiques MK0-MK4 et BR0-BR4
+int input_MK[] = {A0, A2, A4, A6, A8};  // entrées analogiques MK
+int input_BR[] = {A1, A3, A5, A7, A9};  // entrées analogiques BR
+
+const size_t num_inputs = 5;
+const float threshold_voltage = 2.4; // Seuil de détection de 2.4V
+
+// Index pour le balayage des sorties T0-T7
+int current_output = 0;
+float elapsed_time = 0.0;
+
+// État précédent du signal pour détection de front montant
+bool last_signal_state_MK[num_inputs] = {false}; 
+bool last_signal_state_BR[num_inputs] = {false};
+
+// Temps des derniers fronts montants pour chaque paire
+unsigned long last_detection_time[num_inputs] = {0};
+unsigned long last_detect_check[num_inputs] = {0};
+
+// Délai en millisecondes
+const unsigned long debounce_delay = 250 / 1.75; 
+const unsigned long debounce_delay_long = 350 / 1.75; 
+
+// Variable globale pour stocker l'interaction détectée
+int interaction = 0;
+
+// Variables globales pour stocker les valeurs analogiques
+float analog_values_MK[num_inputs] = {0.0};
+float analog_values_BR[num_inputs] = {0.0};
+
+float calculateVelocity(unsigned long delay) {
+  const float minDelay = 600.0;  // 0.6 ms
+  const float maxDelay = 2000.0; // 2 ms
+
+  if (delay < minDelay) {
+    return 1.0; // Vélocité maximale
+  } else if (delay > maxDelay) {
+    return 0.0; // Vélocité minimale
+  } else {
+    // Interpolation linéaire entre minDelay et maxDelay
+    return 1.0 - (delay - minDelay) / (maxDelay - minDelay);
+  }
+}
+
+void MyCallback(float **in, float **out, size_t size) {
+  float sine_signal;
+
+  for (size_t i = 0; i < size; i++) {
+    // État de la machine : activer la sortie courante pour une courte durée
+    if (elapsed_time < 0.001 / 1.75) { // Ajuster ce délai si nécessaire
+      digitalWrite(output_T[current_output], HIGH); // Activer la sortie courante
+    } else {
+      digitalWrite(output_T[current_output], LOW); // Désactiver la sortie
+    }
+
+    // Utilisation des valeurs analogiques lues dans loop()
+    for (size_t k = 0; k < num_inputs; k++) {
+      float analog_value_MK = analog_values_MK[k];
+      float analog_value_BR = analog_values_BR[k];
+
+      // Détection du front montant pour MK
+      bool current_signal_state_MK = analog_value_MK > threshold_voltage;
+      if (current_signal_state_MK && !last_signal_state_MK[k]) {
+        if (millis() - last_detect_check[k] > debounce_delay) {
+          //Serial.print("MK - time: ");
+          //Serial.println(millis());
+          //Serial.print("MK - last detection: ");
+          //Serial.println(last_detection_time[k]);
+          last_detection_time[k] = millis(); // Mise à jour du temps de détection
+        }
+        last_detect_check[k] = millis();
+      }
+      last_signal_state_MK[k] = current_signal_state_MK;
+
+      // Détection du front montant pour BR
+      bool current_signal_state_BR = analog_value_BR > threshold_voltage;
+      if (current_signal_state_BR && !last_signal_state_BR[k]) {
+        if (millis() - last_detect_check[k] > debounce_delay) {
+          //Serial.print("BR - last detection: ");
+          //Serial.println(last_detection_time[k]);
+          unsigned long delay = millis() - last_detection_time[k];
+          float velocity = calculateVelocity(delay);
+          Serial.print("Delay: ");
+          Serial.println(delay);
+          Serial.print("Velocity: ");
+          Serial.println(velocity);
+
+          // Calculer l'index de l'interaction
+          interaction = current_output + 1 + k * num_outputs;  // num_outputs = 5 si 25 keys
+
+          // Déclencher l'enveloppe et adapter le volume
+          adenv.Trigger();
+          amp_knob = velocity; // Ajuster le volume en fonction de la vélocité
+          
+          last_detection_time[k] = millis(); // Mise à jour du temps de détection
+        }
+        last_detect_check[k] = millis();
+      }
+      last_signal_state_BR[k] = current_signal_state_BR;
+    }
+
+    // Jouer une note sinus à la fréquence correspondante
+    if (interaction > 0) {
+      float frequency = pow(2.0, (interaction - 1) / 12.0) * 130.8; // Exemple: Interaction 1 = 130.8 Hz, Interaction 2 = 261.6 Hz, etc.
+      osc.SetFreq(frequency);
+    }
+
+    // Process the envelope
+    float env_value = adenv.Process();
+    osc.SetAmp(amp_knob * env_value); // Amplitude en fonction de la vélocité
+
+    sine_signal = osc.Process();
+    out[0][i] = sine_signal;
+    out[1][i] = sine_signal;
+
+    // Mise à jour du temps écoulé
+    elapsed_time += 1.0 / DAISY.get_samplerate();
+    if (elapsed_time >= 0.002 / 1.75) { // Réduire le délai d'activation pour une fréquence plus élevée
+      elapsed_time = 0.0;
+      // Passer à l'état suivant (sortie T suivante)
+      current_output = (current_output + 1) % num_outputs;
+    }
+  }
+}
+
+void setup() {
+  // Initialize seed at 48kHz
+  float sample_rate;
+  hw = DAISY.init(DAISY_SEED, AUDIO_SR_48K);
+  num_channels = hw.num_channels;
+  sample_rate = DAISY.get_samplerate();
+  osc.Init(sample_rate);
+
+  // Set the parameters for oscillator 
+  osc.SetWaveform(osc.WAVE_SIN);
+  osc.SetFreq(100); // Fréquence initiale
+  osc.SetAmp(0.5);  // Amplitude initiale
+
+  // Set the parameters for envelope
+  adenv.Init(sample_rate);
+  adenv.SetTime(ADENV_SEG_ATTACK, 0.05);
+  adenv.SetTime(ADENV_SEG_DECAY, 0.5);
+  adenv.SetMin(0);
+  adenv.SetMax(1.0);
+  adenv.SetCurve(0);
+
+  // Start callback
+  DAISY.begin(MyCallback);
+
+  // Initialisation des sorties T0-T7
+  for (size_t j = 0; j < num_outputs; j++) {
+    pinMode(output_T[j], OUTPUT);
+  }
+
+  // Initialisation des entrées analogiques
+  for (size_t k = 0; k < num_inputs; k++) {
+    pinMode(input_MK[k], INPUT);
+    pinMode(input_BR[k], INPUT);
+  }
+
+  Serial.begin(9600);
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  analogReadResolution(16);
+
+  // Lecture des valeurs analogiques et stockage dans des variables globales
+  for (size_t k = 0; k < num_inputs; k++) {
+    analog_values_MK[k] = analogRead(input_MK[k]) * (3.3 / 65535.0); // Conversion en tension (3.3V et 16 bits)
+    analog_values_BR[k] = analogRead(input_BR[k]) * (3.3 / 65535.0); // Conversion en tension (3.3V et 16 bits)
+  }
+
+  // Affichage de l'interaction détectée
+  //Serial.print("Current Interaction: ");
+  //Serial.println(interaction);
+
+  // Simulation d'un petit délai pour éviter de saturer le port série
+  delay(1);  // Ajustez ce délai en fonction de la vitesse à laquelle vous voulez afficher les valeurs
+}

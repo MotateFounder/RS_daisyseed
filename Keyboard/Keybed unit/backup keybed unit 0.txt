@@ -1,0 +1,153 @@
+#include <Arduino.h>
+#include "DaisyDuino.h"
+
+DaisyHardware hw;
+static Oscillator osc;
+static AdEnv adenv;
+float pitch_knob;
+float amp_knob;
+
+size_t num_channels;
+
+// Déclaration des pins T0-T7 (correspondant à D1 à D8 sur certains boards)
+int output_pins[] = {1, 2, 3, 4, 5, 6, 7, 8}; // Mise à jour des pins
+const size_t num_outputs = 8;
+
+// Déclaration des entrées analogiques A4-A6
+int input_pins[] = {A3, A4, A5, A6};  // A3 à A6 correspondent aux entrées analogiques
+const size_t num_inputs = 4;
+
+const float threshold_voltage = 2.4; // Seuil de détection de 2.4V
+
+// Index pour le balayage des sorties T0-T7
+int current_output = 0;
+float elapsed_time = 0.0;
+
+// État précédent du signal pour détection de front montant
+bool last_signal_state[num_inputs] = {false}; 
+unsigned long last_detection_time = 0; // Temps de la dernière détection
+const unsigned long debounce_delay = 115/1.75; // Délai en millisecondes (50ms = 20Hz)
+const unsigned long debounce_delay_long = 190/1.75; // Long délai en millisecondes (50ms = 20Hz)
+
+// Variable globale pour stocker l'interaction détectée
+int interaction = 0;
+
+// Variables globales pour stocker les valeurs analogiques
+float analog_values[num_inputs] = {0.0};
+
+void MyCallback(float **in, float **out, size_t size) {
+  float sine_signal;
+
+  for (size_t i = 0; i < size; i++) {
+    // État de la machine : activer la sortie courante pour une courte durée
+    if (elapsed_time < 0.001/1.75) { // Ajuster ce délai si nécessaire
+      digitalWrite(output_pins[current_output], HIGH); // Activer la sortie courante
+    } else {
+      digitalWrite(output_pins[current_output], LOW); // Désactiver la sortie
+    }
+
+    // Utilisation des valeurs analogiques lues dans loop()
+    for (size_t k = 0; k < num_inputs; k++) {
+      float analog_value = analog_values[k];
+
+      // Détection du front montant
+      bool current_signal_state = analog_value > threshold_voltage;
+      if (current_signal_state && !last_signal_state[k]){
+        if ((k == 0) && ((current_output == 1) || (current_output == 2) || (current_output == 4) || (current_output == 5) || (current_output == 7))) { // notes pour lesquelles le delay est plus long
+          if (millis() - last_detection_time > debounce_delay_long){
+            // Calculer l'index de l'interaction (T0-T7 et A3-A7)
+            interaction = current_output + 1 + k * num_outputs;  // num_outputs = 8
+            // Déclencher l'enveloppe
+            adenv.Trigger();
+          }
+        }
+        else {
+          if (millis() - last_detection_time > debounce_delay){
+            // Calculer l'index de l'interaction (T0-T7 et A3-A7)
+            interaction = current_output + 1 + k * num_outputs;  // num_outputs = 8
+            // Déclencher l'enveloppe
+            adenv.Trigger();
+          }
+        }
+        last_detection_time = millis();
+      } 
+      last_signal_state[k] = current_signal_state;
+    }
+
+    // Jouer une note sinus à la fréquence correspondante
+    if (interaction > 0) {
+      float frequency = pow(2.0, (interaction - 1) / 12.0) * 130.8; // Exemple: Interaction 1 = 130.8 Hz, Interaction 2 = 261.6 Hz, etc.
+      osc.SetFreq(frequency);
+      amp_knob = 1;
+    }
+
+    // Process the envelope
+    float env_value = adenv.Process();
+    osc.SetAmp(amp_knob * env_value); // Amplitude fixe pour l'exemple
+
+    sine_signal = osc.Process();
+    out[0][i] = sine_signal;
+    out[1][i] = sine_signal;
+
+    // Mise à jour du temps écoulé
+    elapsed_time += 1.0 / DAISY.get_samplerate();
+    if (elapsed_time >= 0.002/1.75) { // Réduire le délai d'activation pour une fréquence plus élevée
+      elapsed_time = 0.0;
+      // Passer à l'état suivant (sortie T suivante)
+      current_output = (current_output + 1) % num_outputs;
+    }
+  }
+}
+
+void setup() {
+  // Initialize seed at 48kHz
+  float sample_rate;
+  hw = DAISY.init(DAISY_SEED, AUDIO_SR_48K);
+  num_channels = hw.num_channels;
+  sample_rate = DAISY.get_samplerate();
+  osc.Init(sample_rate);
+
+  // Set the parameters for oscillator 
+  osc.SetWaveform(osc.WAVE_SIN);
+  osc.SetFreq(100); // Fréquence initiale
+  osc.SetAmp(0.5);  // Amplitude initiale
+
+  // Set the parameters for envelope
+  adenv.Init(sample_rate);
+  adenv.SetTime(ADENV_SEG_ATTACK, 0.05);
+  adenv.SetTime(ADENV_SEG_DECAY, 0.5);
+  adenv.SetMin(0);
+  adenv.SetMax(1.0);
+  adenv.SetCurve(0);
+
+  // Start callback
+  DAISY.begin(MyCallback);
+
+  // Initialisation des sorties T0-T7
+  for (size_t j = 0; j < num_outputs; j++) {
+    pinMode(output_pins[j], OUTPUT);
+  }
+ 
+  Serial.begin(9600);
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  analogReadResolution(16);
+  
+  // Lecture des valeurs analogiques et stockage dans des variables globales
+  for (size_t k = 0; k < num_inputs; k++) {
+    analog_values[k] = analogRead(input_pins[k]) * (3.3 / 65535.0); // Conversion en tension (3.3V et 16 bits)
+    Serial.print("Analog Input ");
+    Serial.print(k);
+    Serial.print(": ");
+    Serial.println(analog_values[k]);
+  }
+
+  // Affichage de l'interaction détectée
+  Serial.print("Current Interaction: ");
+  Serial.println(interaction);
+
+  // Simulation d'un petit délai pour éviter de saturer le port série
+  delay(1);  // Ajustez ce délai en fonction de la vitesse à laquelle vous voulez afficher les valeurs
+}
